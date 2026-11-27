@@ -1,0 +1,171 @@
+# Shared deploy for TechByPixel: runs on the self-hosted runner on the VPS (label
+# `vps-sydney`) and starts the repository's Docker Compose project with the image tag that
+# build-push-image.yml pushed. The runner reaches GitHub outbound, so the VPS opens no port.
+#
+# What the job does, in /srv/apps/<project> on the VPS:
+#   1. copies the repository's deploy directory there (files are overwritten, never deleted);
+#   2. writes the ENV_FILE secret to .env (mode 600);
+#   3. docker compose pull, then the optional pre-deploy command (e.g. migrations),
+#      then docker compose up -d --remove-orphans --wait;
+#   4. removes images no container has used for 7 days.
+#
+# Conventions for the repository's deploy/compose.yml:
+#   - images are tagged with the variable IMAGE_TAG:
+#       image: ghcr.io/techbypixel/<repo>:${IMAGE_TAG}
+#   - services that need runtime variables use `env_file: .env`;
+#   - services served on a domain join the external network `edge` and carry Traefik labels;
+#   - data lives in named volumes, never in bind mounts inside the deploy directory;
+#   - one-shot services (migrations) sit behind a profile so `up` does not start them, and are
+#     run by pre-deploy, e.g.: docker compose run --rm migrate
+#   - give long-running services a healthcheck, so --wait waits until they are healthy.
+#
+# Usage, in the calling repository (store the whole .env in the repository secret ENV_FILE):
+#
+#   jobs:
+#     deploy:
+#       needs: build
+#       uses: TechByPixel/.github/.github/workflows/deploy-compose.yml@main
+#       secrets: inherit
+#       with:
+#         image-tag: ${{ inputs.image-tag }}   # empty: this commit; sha-xxxxxxx: roll back
+
+name: Deploy with Docker Compose
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        description: Image tag to deploy. Empty deploys sha-<7-char sha> of this commit; an older tag rolls back.
+        type: string
+        default: ""
+      deploy-dir:
+        description: Directory in the repository holding compose.yml and the files it references.
+        type: string
+        default: deploy
+      project:
+        description: Compose project name and folder under /srv/apps. Empty uses the repository name.
+        type: string
+        default: ""
+      pre-deploy:
+        description: Shell command run in the project folder after pull and before up (e.g. migrations).
+        type: string
+        default: ""
+      runner-label:
+        description: Label of the self-hosted runner to deploy on.
+        type: string
+        default: vps-sydney
+      wait-timeout:
+        description: Seconds to wait for the services to become healthy.
+        type: number
+        default: 300
+    secrets:
+      ENV_FILE:
+        description: Whole .env file of the project (KEY=VALUE lines).
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    # One deploy per project at a time; a newer push waits instead of cancelling a deploy halfway.
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve project, folder and tag
+        id: vars
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.image-tag }}
+          INPUT_PROJECT: ${{ inputs.project }}
+        run: |
+          repo="${GITHUB_REPOSITORY#*/}"
+          project="${INPUT_PROJECT:-$repo}"
+          project="${project,,}"
+          if [[ ! "$project" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+            echo "::error::Invalid compose project name '$project'"; exit 1
+          fi
+          {
+            echo "project=$project"
+            echo "dir=/srv/apps/$project"
+            echo "tag=${INPUT_TAG:-sha-${GITHUB_SHA::7}}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+
+      - name: Copy deploy files and write .env
+        shell: bash
+        env:
+          SRC: ${{ inputs.deploy-dir }}
+          DIR: ${{ steps.vars.outputs.dir }}
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+        run: |
+          if [ ! -f "$SRC/compose.yml" ]; then
+            echo "::error::$SRC/compose.yml not found in the repository"; exit 1
+          fi
+          mkdir -p "$DIR"
+          cp -a "$SRC/." "$DIR/"
+          if [ -z "$ENV_FILE" ]; then
+            echo "::warning::Secret ENV_FILE is empty or missing; writing an empty .env"
+          fi
+          (umask 077 && printf '%s\n' "$ENV_FILE" > "$DIR/.env")
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # IMAGE_TAG and COMPOSE_PROJECT_NAME come from the environment, which takes precedence
+      # over .env and over a top-level `name:` in compose.yml.
+      - name: Pull images
+        working-directory: ${{ steps.vars.outputs.dir }}
+        env:
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+          COMPOSE_PROJECT_NAME: ${{ steps.vars.outputs.project }}
+        run: docker compose pull --quiet
+
+      - name: Pre-deploy
+        if: inputs.pre-deploy != ''
+        working-directory: ${{ steps.vars.outputs.dir }}
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+          COMPOSE_PROJECT_NAME: ${{ steps.vars.outputs.project }}
+          PRE_DEPLOY: ${{ inputs.pre-deploy }}
+        run: bash -euo pipefail -c "$PRE_DEPLOY"
+
+      - name: Start services
+        working-directory: ${{ steps.vars.outputs.dir }}
+        env:
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+          COMPOSE_PROJECT_NAME: ${{ steps.vars.outputs.project }}
+          WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        run: docker compose up -d --remove-orphans --wait --wait-timeout "$WAIT_TIMEOUT"
+
+      - name: Show status and logs
+        if: failure()
+        working-directory: ${{ steps.vars.outputs.dir }}
+        env:
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+          COMPOSE_PROJECT_NAME: ${{ steps.vars.outputs.project }}
+        run: |
+          docker compose ps -a
+          docker compose logs --tail 100
+
+      - name: Remove unused images older than 7 days
+        if: success()
+        run: docker image prune -af --filter "until=168h"
+
+      - name: Summary
+        shell: bash
+        env:
+          PROJECT: ${{ steps.vars.outputs.project }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: echo "Deployed \`$PROJECT\` with image tag \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"

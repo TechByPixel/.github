@@ -1,0 +1,128 @@
+# Shared image build for TechByPixel: builds linux/arm64 images (the VPS is an Ampere ARM
+# machine) on a native arm64 GitHub runner and pushes them to GHCR.
+#
+# Every image gets two tags: sha-<7-char commit sha> (what deploy-compose.yml deploys and
+# what a rollback points at) and latest. After the push, only the newest `keep-versions`
+# versions of each image are kept.
+#
+# Image name: ghcr.io/<owner>/<repo>, or ghcr.io/<owner>/<repo>-<name> when the entry has a
+# `name` (one entry per app in a monorepo). Owner and repo are lowercased.
+#
+# Usage, in the calling repository (which must grant `packages: write`):
+#
+#   jobs:
+#     build:
+#       uses: TechByPixel/.github/.github/workflows/build-push-image.yml@main
+#       with:
+#         # context and dockerfile are relative to the repository root.
+#         images: '[{"dockerfile": "Dockerfile"}]'
+#         # Monorepo: '[{"name": "pcc", "dockerfile": "apps/pcc/Dockerfile"},
+#         #             {"name": "content-studio", "dockerfile": "apps/content-studio/Dockerfile"}]'
+#         build-args: |
+#           NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL }}
+
+name: Build and push image
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: >-
+          JSON array, one object per image: {"name"?, "context"? (default "."),
+          "dockerfile"? (default "Dockerfile"), "target"? (multi-stage target)}.
+        type: string
+        required: true
+      build-args:
+        description: Newline-separated KEY=VALUE build arguments passed to every image.
+        type: string
+        default: ""
+      keep-versions:
+        description: Number of newest versions to keep per image in GHCR.
+        type: number
+        default: 10
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.image.name || 'image' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJSON(inputs.images) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve image name and tag
+        id: vars
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          NAME: ${{ matrix.image.name }}
+        run: |
+          repo="${GITHUB_REPOSITORY#*/}"
+          package="${repo,,}"
+          if [ -n "$NAME" ]; then package="${package}-${NAME,,}"; fi
+          {
+            echo "package=$package"
+            echo "image=ghcr.io/${OWNER,,}/$package"
+            echo "tag=sha-${GITHUB_SHA::7}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.vars.outputs.tag }}
+            type=raw,value=latest
+
+      # provenance and sbom are off so each push is one single-platform manifest: attestation
+      # manifests show up as extra untagged versions, and the cleanup below would delete them
+      # out from under the tags that still need them.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.image.context || '.' }}
+          file: ${{ matrix.image.dockerfile || 'Dockerfile' }}
+          target: ${{ matrix.image.target }}
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ inputs.build-args }}
+          cache-from: type=gha,scope=${{ steps.vars.outputs.package }}
+          cache-to: type=gha,mode=max,scope=${{ steps.vars.outputs.package }}
+
+      # Housekeeping only: a failure here must not block the deploy.
+      - name: Delete old image versions
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ steps.vars.outputs.package }}
+          package-type: container
+          min-versions-to-keep: ${{ inputs.keep-versions }}
+
+      - name: Summary
+        shell: bash
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: echo "Pushed \`$IMAGE:$TAG\` (linux/arm64)" >> "$GITHUB_STEP_SUMMARY"

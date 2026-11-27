@@ -1,0 +1,46 @@
+# Deploy to the TechByPixel VPS: build the arm64 image to GHCR → Docker Compose on the VPS.
+# Lint and tests are not run here: they run before the push.
+#
+# The repository also needs:
+#   - Dockerfile (path below in `images`);
+#   - deploy/compose.yml (conventions: header of TechByPixel/.github deploy-compose.yml);
+#   - repository secret ENV_FILE holding the whole runtime .env;
+#   - repository variables for build-time values (NEXT_PUBLIC_*), passed in `build-args`.
+#
+# Roll back: Actions → Deploy → Run workflow, image-tag = an older sha-xxxxxxx.
+# That run skips the build and deploys the given tag.
+
+name: Deploy
+
+on:
+  push:
+    branches: [$default-branch]
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: Image tag to deploy (empty = this commit; sha-xxxxxxx = roll back)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    if: ${{ !inputs.image-tag }}
+    uses: TechByPixel/.github/.github/workflows/build-push-image.yml@main
+    with:
+      images: '[{"dockerfile": "Dockerfile"}]'
+      # build-args: |
+      #   NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL }}
+
+  # Runs after a successful build, or straight away on a rollback (build skipped).
+  deploy:
+    needs: build
+    if: ${{ !failure() && !cancelled() }}
+    uses: TechByPixel/.github/.github/workflows/deploy-compose.yml@main
+    secrets: inherit
+    with:
+      image-tag: ${{ inputs.image-tag }}
+      # pre-deploy: docker compose run --rm migrate

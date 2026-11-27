@@ -1,0 +1,7 @@
+{
+  "name": "Deploy to TechByPixel VPS",
+  "description": "Build an arm64 image to GHCR, then deploy it to the VPS with Docker Compose.",
+  "iconName": "octicon rocket",
+  "categories": ["Deployment", "JavaScript", "TypeScript"],
+  "filePatterns": ["package.json$"]
+}
